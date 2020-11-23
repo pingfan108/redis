@@ -721,6 +721,7 @@ clusterNode *createClusterNode(char *nodename, int flags) {
     node->slaves = NULL;
     node->slaveof = NULL;
     node->ping_sent = node->pong_received = 0;
+    node->data_received = 0;
     node->fail_time = 0;
     node->link = NULL;
     memset(node->ip,0,sizeof(node->ip));
@@ -1434,7 +1435,10 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
             }
         } else {
             /* If it's not in NOADDR state and we don't have it, we
-             * start a handshake process against this IP/PORT pairs.
+             * add it to our trusted dict with exact nodeid and flag.
+             * Note that we cannot simply start a handshake against
+             * this IP/PORT pairs, since IP/PORT can be reused already,
+             * otherwise we risk joining another cluster.
              *
              * Note that we require that the sender of this gossip message
              * is a well known node in our cluster, otherwise we risk
@@ -1443,7 +1447,12 @@ void clusterProcessGossipSection(clusterMsg *hdr, clusterLink *link) {
                 !(flags & CLUSTER_NODE_NOADDR) &&
                 !clusterBlacklistExists(g->nodename))
             {
-                clusterStartHandshake(g->ip,ntohs(g->port),ntohs(g->cport));
+                clusterNode *node;
+                node = createClusterNode(g->nodename, flags);
+                memcpy(node->ip,g->ip,NET_IP_STR_LEN);
+                node->port = ntohs(g->port);
+                node->cport = ntohs(g->cport);
+                clusterAddNode(node);
             }
         }
 
@@ -1650,6 +1659,7 @@ int clusterProcessPacket(clusterLink *link) {
     clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
     uint32_t totlen = ntohl(hdr->totlen);
     uint16_t type = ntohs(hdr->type);
+    mstime_t now = mstime();
 
     if (type < CLUSTERMSG_TYPE_COUNT)
         server.cluster->stats_bus_messages_received[type]++;
@@ -1713,6 +1723,13 @@ int clusterProcessPacket(clusterLink *link) {
 
     /* Check if the sender is a known node. */
     sender = clusterLookupNode(hdr->sender);
+
+    /* Update the last time we saw any data from this node. We
+     * use this in order to avoid detecting a timeout from a node that
+     * is just sending a lot of data in the cluster bus, for instance
+     * because of Pub/Sub. */
+    if (sender) sender->data_received = now;
+
     if (sender && !nodeInHandshake(sender)) {
         /* Update our curretEpoch if we see a newer epoch in the cluster. */
         senderCurrentEpoch = ntohu64(hdr->currentEpoch);
@@ -1727,7 +1744,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
         /* Update the replication offset info for this node. */
         sender->repl_offset = ntohu64(hdr->offset);
-        sender->repl_offset_time = mstime();
+        sender->repl_offset_time = now;
         /* If we are a slave performing a manual failover and our master
          * sent its offset while already paused, populate the MF state. */
         if (server.cluster->mf_end &&
@@ -1841,7 +1858,7 @@ int clusterProcessPacket(clusterLink *link) {
                  * address. */
                 serverLog(LL_DEBUG,"PONG contains mismatching sender ID. About node %.40s added %d ms ago, having flags %d",
                     link->node->name,
-                    (int)(mstime()-(link->node->ctime)),
+                    (int)(now-(link->node->ctime)),
                     link->node->flags);
                 link->node->flags |= CLUSTER_NODE_NOADDR;
                 link->node->ip[0] = '\0';
@@ -1876,7 +1893,7 @@ int clusterProcessPacket(clusterLink *link) {
 
         /* Update our info about the node */
         if (link->node && type == CLUSTERMSG_TYPE_PONG) {
-            link->node->pong_received = mstime();
+            link->node->pong_received = now;
             link->node->ping_sent = 0;
 
             /* The PFAIL condition can be reversed without external
@@ -2023,7 +2040,7 @@ int clusterProcessPacket(clusterLink *link) {
                     "FAIL message received from %.40s about %.40s",
                     hdr->sender, hdr->data.fail.about.nodename);
                 failing->flags |= CLUSTER_NODE_FAIL;
-                failing->fail_time = mstime();
+                failing->fail_time = now;
                 failing->flags &= ~CLUSTER_NODE_PFAIL;
                 clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG|
                                      CLUSTER_TODO_UPDATE_STATE);
@@ -2076,9 +2093,9 @@ int clusterProcessPacket(clusterLink *link) {
         /* Manual failover requested from slaves. Initialize the state
          * accordingly. */
         resetManualFailover();
-        server.cluster->mf_end = mstime() + CLUSTER_MF_TIMEOUT;
+        server.cluster->mf_end = now + CLUSTER_MF_TIMEOUT;
         server.cluster->mf_slave = sender;
-        pauseClients(mstime()+(CLUSTER_MF_TIMEOUT*2));
+        pauseClients(now+(CLUSTER_MF_TIMEOUT*CLUSTER_MF_PAUSE_MULT));
         serverLog(LL_WARNING,"Manual failover requested by replica %.40s.",
             sender->name);
     } else if (type == CLUSTERMSG_TYPE_UPDATE) {
@@ -3486,7 +3503,6 @@ void clusterCron(void) {
     while((de = dictNext(di)) != NULL) {
         clusterNode *node = dictGetVal(de);
         now = mstime(); /* Use an updated time at every iteration. */
-        mstime_t delay;
 
         if (node->flags &
             (CLUSTER_NODE_MYSELF|CLUSTER_NODE_NOADDR|CLUSTER_NODE_HANDSHAKE))
@@ -3510,7 +3526,7 @@ void clusterCron(void) {
                 this_slaves = okslaves;
         }
 
-        /* If we are waiting for the PONG more than half the cluster
+        /* If we are not receiving any data for more than half the cluster
          * timeout, reconnect the link: maybe there is a connection
          * issue even if the node is alive. */
         if (node->link && /* is connected */
@@ -3519,7 +3535,9 @@ void clusterCron(void) {
             node->ping_sent && /* we already sent a ping */
             node->pong_received < node->ping_sent && /* still waiting pong */
             /* and we are waiting for the pong more than timeout/2 */
-            now - node->ping_sent > server.cluster_node_timeout/2)
+            now - node->ping_sent > server.cluster_node_timeout/2 &&
+            /* and in such interval we are not seeing any traffic at all. */
+            now - node->data_received > server.cluster_node_timeout/2)
         {
             /* Disconnect the link, it will be reconnected automatically. */
             freeClusterLink(node->link);
@@ -3554,7 +3572,13 @@ void clusterCron(void) {
         /* Compute the delay of the PONG. Note that if we already received
          * the PONG, then node->ping_sent is zero, so can't reach this
          * code at all. */
-        delay = now - node->ping_sent;
+        mstime_t delay = now - node->ping_sent;
+
+        /* We consider every incoming data as proof of liveness, since
+         * our cluster bus link is also used for data: under heavy data
+         * load pong delays are possible. */
+        mstime_t data_delay = now - node->data_received;
+        if (data_delay < delay) delay = data_delay;
 
         if (delay > server.cluster_node_timeout) {
             /* Timeout reached. Set the node as possibly failing if it is
@@ -4910,7 +4934,8 @@ void restoreCommand(client *c) {
     }
 
     /* Make sure this key does not already exist here... */
-    if (!replace && lookupKeyWrite(c->db,c->argv[1]) != NULL) {
+    robj *key = c->argv[1];
+    if (!replace && lookupKeyWrite(c->db,key) != NULL) {
         addReply(c,shared.busykeyerr);
         return;
     }
@@ -4932,23 +4957,37 @@ void restoreCommand(client *c) {
 
     rioInitWithBuffer(&payload,c->argv[3]->ptr);
     if (((type = rdbLoadObjectType(&payload)) == -1) ||
-        ((obj = rdbLoadObject(type,&payload,c->argv[1])) == NULL))
+        ((obj = rdbLoadObject(type,&payload,key)) == NULL))
     {
         addReplyError(c,"Bad data format");
         return;
     }
 
     /* Remove the old key if needed. */
-    if (replace) dbDelete(c->db,c->argv[1]);
+    int deleted = 0;
+    if (replace)
+        deleted = dbDelete(c->db,key);
+
+    if (ttl && !absttl) ttl+=mstime();
+    if (ttl && checkAlreadyExpired(ttl)) {
+        if (deleted) {
+            rewriteClientCommandVector(c,2,shared.del,key);
+            signalModifiedKey(c->db,key);
+            notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
+            server.dirty++;
+        }
+        decrRefCount(obj);
+        addReply(c, shared.ok);
+        return;
+    }
 
     /* Create the key and set the TTL if any */
-    dbAdd(c->db,c->argv[1],obj);
+    dbAdd(c->db,key,obj);
     if (ttl) {
-        if (!absttl) ttl+=mstime();
-        setExpire(c,c->db,c->argv[1],ttl);
+        setExpire(c,c->db,key,ttl);
     }
     objectSetLRUOrLFU(obj,lfu_freq,lru_idle,lru_clock);
-    signalModifiedKey(c->db,c->argv[1]);
+    signalModifiedKey(c->db,key);
     addReply(c,shared.ok);
     server.dirty++;
 }
@@ -5701,6 +5740,15 @@ int clusterRedirectBlockedClientIfNeeded(client *c) {
             robj *key = dictGetKey(de);
             int slot = keyHashSlot((char*)key->ptr, sdslen(key->ptr));
             clusterNode *node = server.cluster->slots[slot];
+
+            /* if the client is read-only and attempting to access key that our
+             * replica can handle, allow it. */
+            if ((c->flags & CLIENT_READONLY) &&
+                (c->lastcmd->flags & CMD_READONLY) &&
+                nodeIsSlave(myself) && myself->slaveof == node)
+            {
+                node = myself;
+            }
 
             /* We send an error and unblock the client if:
              * 1) The slot is unassigned, emitting a cluster down error.

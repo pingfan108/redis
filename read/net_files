@@ -1,0 +1,9 @@
+apsara  staff   17645  6 15 10:14 ae.c         # 统一epoll/evport/kqueue/select网络事件轮询器接口, 函数实现
+apsara  staff    5338  6 15 10:14 ae.h         # 统一epoll/evport/kqueue/select网络事件轮询器接口, 函数原型与结构体定义
+apsara  staff    4846  6 15 10:14 ae_epoll.c   # 封装epoll网络事件轮询库到统一的接口
+apsara  staff   10939  6 15 10:14 ae_evport.c  # 封装evport网络事件轮询库到统一的接口
+apsara  staff    4567  6 15 10:14 ae_kqueue.c  # 封装kqueue网络事件轮询库到统一的接口
+apsara  staff    3828  6 15 10:14 ae_select.c  # 封装select网络事件轮询库到统一的接口
+apsara  staff   20701  6 15 10:14 anet.c       # 封装socket操作, 屏蔽系统底层socket操作的差异性, 提供更好用的api, 实现
+apsara  staff    3562  6 15 10:14 anet.h       # 封装socket操作, 屏蔽系统底层socket操作的差异性, 提供更好用的api, 声明
+apsara  staff   87721  6 15 10:14 networking.c # 网络事件轮询器回调的事件处理器及其相关部分的实现
